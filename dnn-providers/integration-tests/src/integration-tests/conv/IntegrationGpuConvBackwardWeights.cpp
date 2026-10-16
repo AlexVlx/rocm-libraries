@@ -83,9 +83,6 @@ public:
 protected:
     void runGraphTest() override
     {
-        // rocBLAS/Tensile heap-buffer-overflow on gfx90a; CK ASAN stall on gfx942
-        SKIP_IF_ASAN();
-
         const auto& testCase = this->GetParam();
         const auto& [layout, convTestCase] = testCase;
 
@@ -95,7 +92,7 @@ protected:
 
         this->setTestCaseLayout(layout.name);
         this->setTestCaseNote(convTestCase.note);
-        this->synthesis().setGlobalSeed(convTestCase.seed);
+        this->inputFillRecipes().setGlobalSeed(convTestCase.seed);
         this->verifyGraph(graphObj);
     }
 };
@@ -115,14 +112,14 @@ template <typename DataType>
 class ConvBackwardWeightsLargeValues : public ConvBackwardWeights<DataType>
 {
 protected:
-    SynthesisResult initializeBundle(const hipdnn_frontend::graph::Graph& graph,
-                                     hipdnn_test_sdk::utilities::GraphTensorBundle& bundle) override
+    FillResult initializeBundle(const hipdnn_frontend::graph::Graph& graph,
+                                hipdnn_test_sdk::utilities::GraphTensorBundle& bundle) override
     {
         for(auto& [uid, tensor] : bundle.tensors)
         {
             if(!bundle.isOutput(uid))
             {
-                this->synthesis().setRange(uid, -10.0f, 10.0f);
+                this->inputFillRecipes().setRange(uid, -10.0f, 10.0f);
             }
         }
         return ConvBackwardWeights<DataType>::initializeBundle(graph, bundle);

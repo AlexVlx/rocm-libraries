@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hipdnn_backend.h>
 #include <hipdnn_data_sdk/types.hpp>
+#include <hipdnn_data_sdk/utilities/EngineNames.hpp>
 #include <hipdnn_data_sdk/utilities/ShapeUtilities.hpp>
 #include <hipdnn_data_sdk/utilities/Tensor.hpp>
 #include <hipdnn_frontend.hpp>
@@ -16,6 +17,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <string>
 #include <vector>
 
 // NOLINTBEGIN(google-global-names-in-headers)
@@ -88,14 +90,36 @@ using hipdnn_data_sdk::types::half;
         }                                                                                       \
     } while(0)
 
+// Gracefully skip a sample when no GPU is present: prints a skip message and
+// returns 0 from the enclosing function.
+#define RETURN_SUCCESS_IF_NO_DEVICE()                                         \
+    do                                                                        \
+    {                                                                         \
+        int deviceCount = 0;                                                  \
+        if(hipGetDeviceCount(&deviceCount) != hipSuccess || deviceCount == 0) \
+        {                                                                     \
+            std::cout << "SKIPPED: No GPU devices available.\n";              \
+            return 0;                                                         \
+        }                                                                     \
+    } while(0)
+
 // SAMPLE TYPES
 
 enum class SampleType
 {
     GENERIC,
     BN_TRAINING,
-    SDPA
+    SDPA,
+    BN_WITH_PASS_BY_VALUE, // batchnorm samples that support pass-by-value tensors (epsilon)
 };
+
+// Single source of truth for which sample types accept --runtime-pass-by-value, so the
+// help text and the CLI parser can't drift out of sync as more sample types gain support.
+inline bool supportsRuntimePassByValue(SampleType sampleType)
+{
+    return sampleType == SampleType::BN_TRAINING || sampleType == SampleType::BN_WITH_PASS_BY_VALUE
+           || sampleType == SampleType::SDPA;
+}
 
 // HELP MESSAGE
 
@@ -135,6 +159,12 @@ inline void printSampleHelp(const std::string& sampleName,
                   << "  --full-training             Use running statistics\n";
     }
 
+    if(supportsRuntimePassByValue(sampleType))
+    {
+        std::cout << "  --runtime-pass-by-value     Supply pass-by-value tensors as runtime host\n"
+                  << "                              values instead of compile-time constants\n";
+    }
+
     std::cout << "  --help, -h                  Show this help message\n\n";
 }
 
@@ -144,6 +174,7 @@ struct Config
 {
     bool cpuValidation = false;
     bool useRunningStats = false;
+    bool useRuntimePassByValue = false;
 
     int engineId = -1;
     std::string dtype;
@@ -262,6 +293,8 @@ inline void printConfig(const Config& config)
     printList("--stride", config.stride);
     printList("--padding", config.padding);
     printList("--dilation", config.dilation);
+    std::cout << "  --runtime-pass-by-value: " << (config.useRuntimePassByValue ? "true" : "false")
+              << '\n';
 
     std::cout << '\n';
 }
@@ -288,6 +321,10 @@ inline Config
         else if(arg == "--full-training" && sampleType == SampleType::BN_TRAINING)
         {
             config.useRunningStats = true;
+        }
+        else if(arg == "--runtime-pass-by-value" && supportsRuntimePassByValue(sampleType))
+        {
+            config.useRuntimePassByValue = true;
         }
         else if(arg == "--engine-id")
         {
@@ -421,10 +458,39 @@ inline Config
     return config;
 }
 
+// Warns when `--engine-name` names nothing this process loaded. The check is on the
+// resolved ID rather than the string, so a name, a decimal ID and the hexadecimal ID an
+// unnamed engine displays under are all answered on the same terms. A miss is not fatal:
+// the name may belong to a plugin that was not loaded, and the preference is soft in any
+// case, so the run continues on the heuristic's pick.
+inline void warnOnUnknownEngineName(hipdnnHandle_t handle, const Config& config)
+{
+    if(config.engineName.empty())
+    {
+        return;
+    }
+
+    const int64_t engineId = hipdnn_data_sdk::utilities::engineNameOrIdToId(config.engineName);
+
+    size_t engineNameLen = 0;
+    if(hipdnnGetEngineNameById_ext(handle, engineId, nullptr, &engineNameLen)
+       == HIPDNN_STATUS_SUCCESS)
+    {
+        return;
+    }
+
+    std::cerr << "Warning: no loaded engine carries '" << config.engineName << "' (engine ID "
+              << hipdnn_data_sdk::utilities::formatEngineIdHex(engineId)
+              << "). Check the spelling, and HIPDNN_PLUGIN_DIR if it names a plugin engine. "
+                 "Continuing with the engine the heuristic picks.\n";
+}
+
 template <typename F>
 bool run(F&& f)
 {
     bool allPassed = true;
+
+    warnOnUnknownEngineName(f.handle, f.config);
 
     const std::vector<std::string> dtypes = {"fp32", "fp16", "bf16"};
     const std::vector<std::pair<std::string, TensorLayout>> layouts
@@ -467,9 +533,10 @@ bool run(F&& f)
 // ENGINE SELECTION
 
 // Applies the engine preference from `config` (--engine-id or --engine-name) to `graph`.
-// An unrecognized --engine-name almost always indicates a typo, so this exits with an
-// error rather than silently continuing with a default/unintended engine. Centralized
-// here so every sample gets consistent validation instead of duplicating this logic.
+// The name is handed to the graph as a string rather than resolved here, so the graph
+// applies the same name-or-ID resolution every other name-addressed surface uses. The
+// preference is soft: an ID that matches no engine config is discarded when the graph is
+// built and the heuristic's pick runs instead.
 inline void setPreferredEngine(hipdnn_frontend::graph::Graph& graph, const Config& config)
 {
     if(config.engineId != -1)
@@ -478,14 +545,9 @@ inline void setPreferredEngine(hipdnn_frontend::graph::Graph& graph, const Confi
     }
     else if(!config.engineName.empty())
     {
-        if(!hipdnn_data_sdk::utilities::isEngineNameRegistered(config.engineName))
-        {
-            std::cerr << "Error: Unknown engine name: " << config.engineName << '\n';
-            exit(EXIT_FAILURE);
-        }
+        std::cout << "  preferring engine name '" << config.engineName << "'\n";
 
-        graph.set_preferred_engine_id_ext(
-            hipdnn_data_sdk::utilities::engineNameToId(config.engineName));
+        graph.set_preferred_engine_id_ext(config.engineName);
     }
 }
 
@@ -494,6 +556,29 @@ inline void setPreferredEngine(const std::shared_ptr<hipdnn_frontend::graph::Gra
                                const Config& config)
 {
     setPreferredEngine(*graph, config);
+}
+
+// Resolves `engineId` to the name its engine carries, asking the backend through
+// `handle`. That answers for any loaded engine, candidate for a particular graph or
+// not, and reaches plugin-supplied names the built-in registry does not carry. An ID
+// no loaded engine provides falls through to the registry and then to the hexadecimal
+// rendering, so callers always get a printable name.
+inline std::string getEngineName(hipdnnHandle_t handle, int64_t engineId)
+{
+    size_t engineNameLen = 0;
+    if(hipdnnGetEngineNameById_ext(handle, engineId, nullptr, &engineNameLen)
+           == HIPDNN_STATUS_SUCCESS
+       && engineNameLen > 0)
+    {
+        std::vector<char> engineName(engineNameLen);
+        if(hipdnnGetEngineNameById_ext(handle, engineId, engineName.data(), &engineNameLen)
+           == HIPDNN_STATUS_SUCCESS)
+        {
+            return {engineName.data()};
+        }
+    }
+
+    return hipdnn_frontend::detail::resolveEngineName(engineId);
 }
 
 // TENSOR HELPERS
