@@ -26,6 +26,8 @@
 
 #include "SolutionIterator.hpp"
 
+#include "ClientProblemFactory.hpp"
+
 #include "ResultReporter.hpp"
 #include "TimingInstrumentation.hpp"
 #include <Tensile/Debug.hpp>
@@ -47,11 +49,12 @@ namespace TensileLite
             int    gridbasedTopSols    = Debug::Instance().getGridbasedTopSols();
             bool   printWinnerOnly     = args["PrintWinnersOnly"].as<bool>();
             double predictionThreshold = args["prediction-threshold"].as<double>();
+            bool   requireSelectedSolution = args["require-selected-solution"].as<bool>();
 
             if(bestSolution)
             {
                 return std::make_shared<TopSolutionIterator>(
-                    library, hardware, predictionThreshold, gridbasedTopSols, printWinnerOnly);
+                    library, hardware, predictionThreshold, gridbasedTopSols, requireSelectedSolution, printWinnerOnly);
             }
             else
             {
@@ -139,11 +142,7 @@ namespace TensileLite
                 return false;
             }
 
-            if(solution.requiredHostWorkspaceSizePerProblem == static_cast<size_t>(-1))
-            {
-                solution.requiredHostWorkspaceSizePerProblem
-                    = solution.requiredHostSizeGroupedGemmSingle(problem, *m_hardware);
-            }
+            solution.ensureRequiredHostWorkspaceSize(problem, *m_hardware);
             return true;
         }
 
@@ -163,6 +162,16 @@ namespace TensileLite
             }
             else if(auto problem = dynamic_cast<ContractionProblemGemm*>(m_problem))
             {
+                if(m_split != nullptr && m_split->numSlices() > 1)
+                {
+                    for(size_t d = 0; d < m_split->numSlices(); d++)
+                        if(!checkSolution(
+                               solution,
+                               *dynamic_cast<ContractionProblemGemm*>(
+                                   m_split->sliceProblem(m_problem, d))))
+                            return false;
+                    return true;
+                }
                 return checkSolution(solution, *problem);
             }
             else
@@ -358,6 +367,21 @@ namespace TensileLite
             , m_predictionThreshold(predictionThreshold)
         {
             m_firstSolutionIdx = firstSolutionIdx;
+
+            // Indexes library->solutions. For an indexed library that map is
+            // empty until caches are parsed and published; materializeAllSolutions()
+            // does both. The cache's own materializeAll() only parses, and
+            // leaves the reads below on an empty map.
+            //
+            // Best/Top iterators must not call this: they measure selection
+            // latency and should stay lazy.
+            library->materializeAllSolutions();
+
+            if(library->solutions.empty())
+            {
+                throw std::runtime_error(
+                    "[AllSolutionsIterator] library contains no solutions to enumerate");
+            }
 
             if(m_firstSolutionIdx < 0)
                 m_firstSolutionIdx = library->solutions.begin()->first;
@@ -560,7 +584,10 @@ namespace TensileLite
             }
             if(m_currentSolution == nullptr)
             {
-                m_currentSolution = m_library->solutions.find(0)->second;
+                // Goes through the resolver rather than solutions.find(0):
+                // indexed libraries have not materialized index 0 yet, and the
+                // old form dereferenced end() when it was missing.
+                m_currentSolution = m_library->resolveSolutionByIndex(0);
             }
             m_usedCurrentSolution = false;
         }
@@ -595,10 +622,12 @@ namespace TensileLite
             std::shared_ptr<Hardware>                                      hardware,
             double                                                         predictionThreshold,
             int                                                            numSolutions,
+            bool                                                           requireSelectedSolution,
             bool                                                           printWinnerOnly)
             : SolutionIterator(library, hardware, printWinnerOnly)
             , m_numSolutions(numSolutions)
             , m_predictionThreshold(predictionThreshold)
+            , m_requireSelectedSolution(requireSelectedSolution)
         {
         }
 
@@ -633,7 +662,30 @@ namespace TensileLite
             }
             if(m_solutions.size() == 0)
             {
-                m_solutions.push_back(m_library->solutions.find(0)->second);
+                if(m_requireSelectedSolution)
+                {
+                    // No fallback: report it, count it as an error and skip the problem
+                    // (moreSolutionsInProblem() is false with no solution and an empty queue).
+                    m_problemsWithoutSelection++;
+                    m_currentSolutionIdx = 0;
+                    auto const* gemmProblem = dynamic_cast<const ContractionProblemGemm*>(problem);
+                    if(auto groupedProblem
+                       = dynamic_cast<const ContractionProblemGroupedGemm*>(problem))
+                        gemmProblem = &groupedProblem->gemms[0];
+                    std::ostringstream msg;
+                    msg << "[TopSolutionIterator] No solution selected for problem "
+                        << gemmProblem->operationIdentifier() << " sizes";
+                    for(auto size : gemmProblem->problemSizes())
+                        msg << " " << size;
+                    msg << ": the library returned no solution and --require-selected-solution"
+                           " is set, so library solution 0 is not used instead."
+                        << std::endl;
+                    m_reporter->log(LogLevel::Error, msg.str());
+                    return;
+                }
+                // See the note in BestSolutionIterator::preProblem.
+                if(auto fallback = m_library->resolveSolutionByIndex(0))
+                    m_solutions.push_back(fallback);
             }
 
             if(m_predictionThreshold > 1.0 || !isPredictionAvailable(*m_hardware))
@@ -719,6 +771,11 @@ namespace TensileLite
                 }
             }
 
+        }
+
+        int TopSolutionIterator::error() const
+        {
+            return m_problemsWithoutSelection;
         }
 
         bool TopSolutionIterator::moreSolutionsInProblem() const

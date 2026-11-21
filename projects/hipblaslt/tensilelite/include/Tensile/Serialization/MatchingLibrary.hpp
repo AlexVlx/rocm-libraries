@@ -32,6 +32,7 @@
 #include <Tensile/SingleSolutionLibrary.hpp>
 
 #include <cstddef>
+#include <cstring>
 #include <tuple>
 #include <unordered_set>
 
@@ -57,7 +58,102 @@ namespace TensileLite
 
             static void mapping(IO& io, Table& table)
             {
-                iot::mapRequired(io, "table", table.table);
+                bool usedBin = false;
+
+                if constexpr(std::is_same_v<Key, std::array<int64_t, 4>>)
+                {
+                    const uint8_t* binPtr  = nullptr;
+                    size_t         binSize = 0;
+
+                    if(!iot::outputting(io)
+                       && iot::mapRawBytes(io, "table_bin", binPtr, binSize))
+                    {
+                        usedBin = true;
+
+                        int32_t count = 0;
+                        iot::mapRequired(io, "table_count", count);
+
+                        if(binSize != static_cast<size_t>(count) * 20)
+                        {
+                            iot::setError(
+                                io,
+                                concatenate("table_bin size mismatch: expected ",
+                                            count * 20, " bytes, got ", binSize));
+                        }
+                        else
+                        {
+                            using SSLibrary = SingleSolutionLibrary<ContractionProblemGemm,
+                                                                    ContractionSolution>;
+                            auto ctx = static_cast<LibraryIOContext<ContractionSolution>*>(
+                                iot::getContext(io));
+
+                            if(!ctx || (!ctx->blobCache && !ctx->solutions))
+                            {
+                                iot::setError(
+                                    io,
+                                    "table_bin requires LibraryIOContext with "
+                                    "solutions or blobCache.");
+                                return;
+                            }
+
+                            std::unordered_map<int32_t, std::shared_ptr<SSLibrary>> solCache;
+                            table.table.resize(count);
+
+                            for(int32_t i = 0; i < count; ++i)
+                            {
+                                const uint8_t* rec = binPtr + i * 20;
+                                int32_t k0, k1, k2, k3, idx;
+                                std::memcpy(&k0, rec,      sizeof(int32_t));
+                                std::memcpy(&k1, rec + 4,  sizeof(int32_t));
+                                std::memcpy(&k2, rec + 8,  sizeof(int32_t));
+                                std::memcpy(&k3, rec + 12, sizeof(int32_t));
+                                std::memcpy(&idx, rec + 16, sizeof(int32_t));
+
+                                auto& entry = table.table[i];
+                                entry.key   = {static_cast<int64_t>(k0),
+                                               static_cast<int64_t>(k1),
+                                               static_cast<int64_t>(k2),
+                                               static_cast<int64_t>(k3)};
+                                entry.speed = 0.0;
+
+                                auto [cacheIt, inserted] = solCache.try_emplace(idx, nullptr);
+                                if(inserted)
+                                {
+                                    cacheIt->second
+                                        = resolveSSLibrary<ContractionProblemGemm,
+                                                           ContractionSolution>(ctx, idx);
+                                    if(!cacheIt->second)
+                                    {
+                                        iot::setError(
+                                            io,
+                                            concatenate(
+                                                "[MatchingLibrary] Invalid solution index: ",
+                                                idx));
+                                        return;
+                                    }
+                                }
+                                entry.value = cacheIt->second;
+                            }
+                        }
+                    }
+                }
+
+                if(!usedBin)
+                {
+                    iot::mapRequired(io, "table", table.table);
+                }
+
+                /// Should this GridBased matching table carry a kd-tree index?
+                ///
+                /// Declared by the logic file (`UseKdTree` in the library-logic header), so a
+                /// table that wants the kd-tree says so itself. Absent, mapOptional leaves the
+                /// member at its `false` default and behaviour is unchanged -- which is every
+                /// logic file that predates this key.
+                ///
+                /// Keeping it on the table rather than deciding at load time means library
+                /// deserialization no longer has to probe for a device: it can legitimately run
+                /// with none (CPU-only tooling and tests).
+                iot::mapOptional(io, "useKdTree", table.useKdTree);
 
                 if(!iot::outputting(io))
                 {
@@ -71,7 +167,12 @@ namespace TensileLite
 
                     if constexpr(std::is_same<Distance, Matching::GridBasedDistance<Key>>{})
                     {
-                        if(Debug::Instance().gridBasedKDTree())
+                        // TENSILE_GRIDBASED_KDTREE can only add: it turns the index on for
+                        // every table, and never off for one that asked for it. Resolved here,
+                        // once per table, so the query path reads a single settled member.
+                        table.useKdTree = table.useKdTree || Debug::Instance().gridBasedKDTree();
+
+                        if(table.useKdTree)
                         {
                             // Creating K map
                             for(auto it = table.table.begin(); it != table.table.end(); ++it)
@@ -154,17 +255,24 @@ namespace TensileLite
             {
                 std::string distanceType;
 
+                // On output, mappingDistance writes the distance once the
+                // table's key type is confirmed, so an attempt with the wrong
+                // key type writes nothing.
                 if(iot::outputting(io))
+                {
                     distanceType = lib.table->distanceType();
+                }
+                else
+                {
+                    iot::mapRequired(io, "distance", distanceType);
 
-                iot::mapRequired(io, "distance", distanceType);
+                    std::string tensile_metric = Debug::Instance().getMetric();
+
+                    if(!tensile_metric.empty())
+                        distanceType = tensile_metric;
+                }
 
                 bool success = false;
-
-                std::string tensile_metric = Debug::Instance().getMetric();
-
-                if(!tensile_metric.empty())
-                    distanceType = tensile_metric;
 
                 if(distanceType == "Euclidean")
                 {
@@ -199,7 +307,7 @@ namespace TensileLite
                     success
                         = mappingDistance<Key, Matching::RandomDistance<Key>>(io, lib, properties);
                 }
-                else if(distanceType == "GridBased")
+                else if(distanceType == "GridBased" || distanceType == "MeshBased")
                 {
                     success = mappingDistance<Key, Matching::GridBasedDistance<Key>>(
                         io, lib, properties);
@@ -228,6 +336,9 @@ namespace TensileLite
                     table = std::dynamic_pointer_cast<Table>(lib.table);
                     if(!table)
                         return false;
+
+                    std::string distanceType = table->distanceType();
+                    iot::mapRequired(io, "distance", distanceType);
                 }
                 else
                 {
@@ -260,30 +371,16 @@ namespace TensileLite
                 // TODO there is probably a way to make this properly general
                 if(index != -1)
                 {
-                    using SSLibrary
-                        = SingleSolutionLibrary<ContractionProblemGemm, ContractionSolution>;
-
                     auto ctx
                         = static_cast<LibraryIOContext<ContractionSolution>*>(iot::getContext(io));
-                    if(ctx == nullptr || ctx->solutions == nullptr)
-                    {
-                        iot::setError(io,
-                                      "SingleSolutionLibrary requires that context be set to "
-                                      "a SolutionMap.");
-                    }
-
-                    auto iter = ctx->solutions->find(index);
-                    if(iter == ctx->solutions->end())
-                    {
-                        std::ostringstream msg;
-                        msg << "[MatchingLibrary] Invalid solution index: " << index;
-                        iot::setError(io, msg.str());
-                    }
+                    auto sslib
+                        = resolveSSLibrary<ContractionProblemGemm, ContractionSolution>(ctx, index);
+                    if(sslib)
+                        entry.value = std::move(sslib);
                     else
-                    {
-                        std::shared_ptr<ContractionSolution> solution = iter->second;
-                        entry.value = std::make_shared<SSLibrary>(solution);
-                    }
+                        iot::setError(
+                            io,
+                            concatenate("[MatchingLibrary] Invalid solution index: ", index));
                 }
                 else
                 {

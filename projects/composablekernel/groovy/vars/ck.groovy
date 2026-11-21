@@ -248,6 +248,38 @@ def runShell(String command){
     return (output != "")
 }
 
+// Path-length check (ROCM-29381). Bounds the repository-relative path so the
+// absolute path stays under the Windows MAX_PATH of 260; ninja's Stat() does
+// not honour LongPathsEnabled, so an over-long source path fails the build.
+//
+// Scoped to the files this change adds or renames (--diff-filter=AR) rather
+// than the whole tree: the tree already carries paths over the limit, and
+// unrelated work must not be blocked by them. New paths are what we need to
+// keep short. Modifications are excluded on purpose, so a PR that merely
+// edits a pre-existing long file is not forced into a rename project.
+// Deletions are excluded too, so removing a long path always passes.
+//
+// The diff itself lives in check_changed_path_length.sh, not inline here: a
+// `git diff ... | xargs` pipeline returns xargs's status, so a base ref that
+// does not resolve produced no files and still reported success. The script
+// resolves the base explicitly and fails loudly when it cannot.
+//
+// Called from the unconditional "Determine CI Execution" stage rather than from
+// runStaticChecks(), because that stage is gated on SHOULD_RUN_CI and a change
+// touching only docs, Markdown, .github or .gitignore skips it -- yet such a
+// change can still add a path that breaks the Windows checkout. The script needs
+// only bash and git, so it runs directly on the node instead of inside the CK
+// docker image, and does not depend on the "Build Docker" stage having run.
+//
+// The base branch is interpolated by Groovy rather than read from the shell's
+// environment, so the check does not depend on CHANGE_TARGET being exported.
+def runPathLengthCheck() {
+    def baseBranch = env.CHANGE_TARGET ?: "develop"
+    dir("projects/composablekernel") {
+        sh "script/check_changed_path_length.sh ${baseBranch}"
+    }
+}
+
 def shouldRunCICheck() {
     // File patterns that should not trigger CI
     def skipFilePatterns = [
@@ -642,6 +674,15 @@ def buildDockerFa(install_prefix){
     env.CK_FA_IMAGE = buildAndPushDockerImage(install_prefix, image_name, dockerExtraArgs, true)
 }
 
+def buildDockerFmhaPython(install_prefix){
+    def image_name = "${env.CK_DOCKERHUB_PRIVATE}:ck_fmha_python_${env.GIT_COMMIT.take(12)}_${env.BUILD_NUMBER}"
+    def dockerExtraArgs = " -f projects/composablekernel/Dockerfile.fmha_python"
+    dockerExtraArgs += " --build-arg BASE_DOCKER='${params.fmha_python_base_docker}'"
+    dockerExtraArgs += " --build-arg GPU_ARCHS='gfx1250'"
+    dockerExtraArgs += " --build-arg MAX_JOBS='${nthreads()}' . "
+    env.CK_FMHA_PYTHON_IMAGE = buildAndPushDockerImage(install_prefix, image_name, dockerExtraArgs, true)
+}
+
 def buildDocker(install_prefix){
     buildDockerBase(install_prefix)
     if (params.RUN_PYTORCH_TESTS.toBoolean()) {
@@ -652,6 +693,9 @@ def buildDocker(install_prefix){
     }
     if (params.RUN_FA_TESTS.toBoolean()) {
         buildDockerFa(install_prefix)
+    }
+    if (env.SHOULD_RUN_FMHA_PYTHON_TESTS.toBoolean()) {
+        buildDockerFmhaPython(install_prefix)
     }
 }
 
@@ -667,10 +711,14 @@ def get_docker_options(){
     else{ //only add kfd and dri paths if you actually going to run somthing on GPUs
         dockerOpts = "--device=/dev/kfd --device=/dev/dri --group-add video --group-add render --cap-add=SYS_PTRACE --security-opt seccomp=unconfined"
     }
-    if (params.COMPILER_VERSION == "develop" || params.COMPILER_VERSION == "amd-staging" || params.COMPILER_VERSION == "therock" || params.COMPILER_COMMIT != ""){
+    // Dockerfile.compiler builds /llvm-project only for develop/amd-staging. Every other image,
+    // including TheRock and a COMPILER_COMMIT on another version, keeps the installed ROCm clang.
+    def sourceCompiler = params.COMPILER_VERSION == "develop" || params.COMPILER_VERSION == "amd-staging"
+    if (sourceCompiler || params.COMPILER_VERSION == "therock" || params.COMPILER_COMMIT != ""){
+        def hipClangPath = sourceCompiler ? "/llvm-project/build/bin" : "/opt/rocm/llvm/bin"
     // the  --env COMPRESSED_BUNDLE_FORMAT_VERSION=2 env variable is required when building code with offload-compress flag with
     // newer clang22 compilers and running with older hip runtima libraries
-        dockerOpts = dockerOpts + " --env HIP_CLANG_PATH='/llvm-project/build/bin' --env COMPRESSED_BUNDLE_FORMAT_VERSION=2 --env HIP_PLATFORM=amd "
+        dockerOpts = dockerOpts + " --env HIP_CLANG_PATH='${hipClangPath}' --env COMPRESSED_BUNDLE_FORMAT_VERSION=2 --env HIP_PLATFORM=amd "
     }
     // on some machines the group ids for video and render groups may not be the same as in the docker image!
     def video_id = sh(returnStdout: true, script: 'getent group video | cut -d: -f3')
@@ -703,12 +751,13 @@ def build_and_run_fmha(String arch){
 
 def cmake_build(Map conf=[:]){
 
-    def config_targets = conf.get("config_targets","check")
+    def config_targets = conf.get("config_targets","install")
     def build_envs = "CTEST_PARALLEL_LEVEL=4 " + conf.get("build_env","")
     def prefixpath = conf.get("prefixpath","/opt/rocm")
     def setup_args = conf.get("setup_args","")
     // make sure all unit tests always run on develop branch
     def runAllUnitTests = (env.BRANCH_NAME == "develop") ? true : params.RUN_ALL_UNIT_TESTS
+    echo "runAllUnitTests = ${runAllUnitTests}, RUN_ALL_UNIT_TESTS = ${params.RUN_ALL_UNIT_TESTS}"
 
     if (prefixpath != "/usr/local"){
         setup_args = setup_args + " -DCMAKE_PREFIX_PATH=${prefixpath} "
@@ -723,9 +772,9 @@ def cmake_build(Map conf=[:]){
         cmake_envs = "CXX=/opt/rocm/llvm/bin/clang++ CXXFLAGS='-Werror' " + conf.get("cmake_ex_env","")
     }
 
-    if(conf.get("build_install","") == "true")
+    if(runAllUnitTests)
     {
-        config_targets = 'install ' + config_targets
+        config_targets = 'install'
         setup_args = ' -DBUILD_DEV=On -DCMAKE_INSTALL_PREFIX=../install' + setup_args
     } else{
         setup_args = ' -DBUILD_DEV=On' + setup_args
@@ -827,9 +876,6 @@ def cmake_build(Map conf=[:]){
         if (params.RUN_BUILDER_TESTS && !setup_args.contains("-DCK_CXX_STANDARD=") && !setup_args.contains("gfx10") && !setup_args.contains("gfx11")) {
             setup_args = " -D CK_EXPERIMENTAL_BUILDER=ON "  + setup_args
         }
-        if (params.RUN_ROCM_CK_TESTS) {
-            setup_args = " -D CK_ENABLE_ROCM_CK=ON " + setup_args
-        }
         setup_cmd = conf.get(
             "setup_cmd",
             """${cmake_envs} cmake -G Ninja ${setup_args} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_FLAGS=" -O3 " .. """
@@ -930,8 +976,9 @@ def cmake_build(Map conf=[:]){
             // Note: This else block is when NINJA_BUILD_TRACE=false and BUILD_INSTANCES_ONLY=false
             // So no ninja trace processing needed here
             if (!params.BUILD_INSTANCES_ONLY){
-                if (!runAllUnitTests && !setup_args.contains("gfx1250") ){
+                if (!runAllUnitTests){
                     // Smart Build: Run smart_build_and_test.sh
+                    if( !setup_args.contains("gfx1250") ){
                     sh """
                         export WORKSPACE_ROOT=${env.WORKSPACE}
                         export PARALLEL=32
@@ -941,13 +988,27 @@ def cmake_build(Map conf=[:]){
                         export NINJA_FTIME_TRACE=false
                         bash ../script/dependency-parser/smart_build_and_test.sh
                     """
+                    }
+                    else{ //add extra environment variables for gfx1250
+                    sh """
+                        export HSA_MODEL_LIB=/libhsakmtmodel.so
+                        export HSA_MODEL_TOPOLOGY=/topology/mi450
+                        export WORKSPACE_ROOT=${env.WORKSPACE}
+                        export PARALLEL=32
+                        export NINJA_JOBS=${nt}
+                        export ARCH_NAME=${arch_name}
+                        export PROCESS_NINJA_TRACE=false
+                        export NINJA_FTIME_TRACE=false
+                        bash ../script/dependency-parser/smart_build_and_smoke_test.sh
+                    """
+                    }
                 }
-                else{ //run all tests
+                else{ //run all tests if runAllUnitTests = true
                     if(!setup_args.contains("gfx1250")){
                         echo "Full test suite requested (RUN_ALL_UNIT_TESTS=true or develop branch)"
                         sh "ninja -j${nt} install check"
                     }
-                    else{ //do not run tests on gfx1250, just build everything
+                    else{ //on gfx1250 ffm run only smoke tests because regression tests will take forever
                         echo "Building for gfx1250"
                         sh """
                             export HSA_MODEL_LIB=/libhsakmtmodel.so
@@ -955,13 +1016,10 @@ def cmake_build(Map conf=[:]){
                             ninja -j${nt} install smoke
                         """
                     }
-                    if (params.RUN_ROCM_CK_TESTS) {
-                        sh 'ninja check-rocm-ck'
-                    }
                     if(params.BUILD_PACKAGES || params.BUILD_INSTANCES_ONLY){
                         echo "Build ckProfiler packages"
                         sh 'ninja -j64 package'
-                        sh "mv composablekernel-ckprofiler_*.deb composablekernel-ckprofiler_1.3.0_amd64_${arch_name}.deb"
+                        sh "mv composablekernel-ckprofiler_*.deb composablekernel-ckprofiler_1.4.0_amd64_${arch_name}.deb"
                         stash includes: "composablekernel-ckprofiler**.deb", name: "profiler_package_${arch_name}"
                     }
                 }
@@ -1296,11 +1354,11 @@ def getPytorchTestsCmds() {
         "cd pytorch && USE_ROCM_CK_SDPA=1 PYTORCH_ROCM_ARCH=gfx942 python3 setup.py develop"
     ]
 }
-def getAiterTestsCmds() {
-    return [
+def getAiterTestsCmds(String arch = "") {
+    def cmds = [
         // Pre-compile FlyDSL MoE AOT cache before the tests.
-        "cd /home/jenkins/workspace/aiter && AITER_AOT_IMPORT=1 HIP_VISIBLE_DEVICES=-1 python3 aiter/aot/flydsl/moe.py",
-        "cd /home/jenkins/workspace/aiter && AITER_AOT_IMPORT=1 HIP_VISIBLE_DEVICES=-1 python3 aiter/aot/flydsl/mxfp4_moe.py",
+        "cd /home/jenkins/workspace/aiter && AITER_AOT_IMPORT=1 HIP_VISIBLE_DEVICES=-1 GPU_ARCHS=${arch} python3 aiter/aot/flydsl/moe.py",
+        "cd /home/jenkins/workspace/aiter && AITER_AOT_IMPORT=1 HIP_VISIBLE_DEVICES=-1 GPU_ARCHS=${arch} python3 aiter/aot/flydsl/mxfp4_moe.py",
         "python3 /home/jenkins/workspace/aiter/op_tests/test_gemm_a8w8.py",
         "python3 /home/jenkins/workspace/aiter/op_tests/test_gemm_a8w8_blockscale.py",
         "python3 /home/jenkins/workspace/aiter/op_tests/test_mha.py",
@@ -1311,9 +1369,13 @@ def getAiterTestsCmds() {
         "python3 /home/jenkins/workspace/aiter/op_tests/test_moe_blockscale.py",
         "python3 /home/jenkins/workspace/aiter/op_tests/test_moe_ep.py",
         "python3 /home/jenkins/workspace/aiter/op_tests/test_moe_sorting.py",
-        "python3 /home/jenkins/workspace/aiter/op_tests/test_moe_sorting_mxfp4.py",
         "python3 /home/jenkins/workspace/aiter/op_tests/test_moe_tkw1.py"
     ]
+    // test_moe_sorting_mxfp4.py requires gfx950 and must not run on gfx942
+    if (arch != "gfx942") {
+        cmds << "python3 /home/jenkins/workspace/aiter/op_tests/test_moe_sorting_mxfp4.py"
+    }
+    return cmds
 }
 def getFaTestsCmds() {
     return [
@@ -1321,11 +1383,34 @@ def getFaTestsCmds() {
     ]
 }
 
+def runFmhaPythonTests(String arch) {
+    def resultDir = "fmha-python-results-${arch}"
+    deleteDir()
+    try {
+        run_downstream_tests(
+            image: "${env.CK_FMHA_PYTHON_IMAGE}",
+            timeoutHours: 5,
+            execute_cmds: [
+                "mkdir -p ${resultDir}",
+                """#!/bin/bash
+set -euo pipefail
+python3 -u -m pytest /opt/ck/example/ck_tile/01_fmha/python/tests \
+    -q --tb=short -o cache_dir="\$PWD/${resultDir}/.pytest_cache" --junitxml=${resultDir}/pytest.xml 2>&1 | tee ${resultDir}/pytest.log
+"""
+            ])
+    } finally {
+        archiveArtifacts artifacts: "${resultDir}/*", allowEmptyArchive: true
+        if (fileExists("${resultDir}/pytest.xml")) {
+            junit testResults: "${resultDir}/pytest.xml"
+        }
+    }
+}
+
 // All static checks in one container on a single node: clang-format (always),
-// cppcheck (when RUN_CPPCHECK), then the ASCII-only and CRLF checks. Combined
-// into a single buildAndTest, driven by one Jenkinsfile stage, to keep the
-// declarative pipeline's WorkflowScript under the JVM 64KB method-size limit and
-// to avoid per-check checkout/container overhead.
+// cppcheck (when RUN_CPPCHECK), then the ASCII-only, CRLF and path-length
+// checks. Combined into a single buildAndTest, driven by one Jenkinsfile stage,
+// to keep the declarative pipeline's WorkflowScript under the JVM 64KB
+// method-size limit and to avoid per-check checkout/container overhead.
 //
 // Every check runs from projects/composablekernel (cmake_build runs execute_cmd
 // from .../build, so the single leading `cd ..` lands there); no check changes
@@ -1346,6 +1431,12 @@ def runStaticChecks() {
     }
     checks << """${checkFiles} -print0 | xargs -0 -P 8 -n 64 script/check_ascii_only.sh"""
     checks << """${checkFiles} -print0 | xargs -0 -P 8 -n 64 script/check_no_crlf.sh"""
+
+    // The path-length check (ROCM-29381) deliberately does NOT live here. This
+    // stage is gated on SHOULD_RUN_CI, which is false for a change touching only
+    // docs, Markdown, .github or .gitignore -- categories that can still carry an
+    // over-long path. See runPathLengthCheck(), called unconditionally from the
+    // "Determine CI Execution" stage.
 
     buildAndTest(
         setup_args: "NO_CK_BUILD",
@@ -1408,23 +1499,65 @@ def runComprehensiveConvDatasetTests() {
 String _dispatcherPerfCmd(String compiler, String gpuTarget, String samplingTier,
                           String gemmDatatype, String gemmLayout, String multiLayout,
                           String quantDatatype, String quantLayout,
-                          String problemSizes, String problemConfigs, String perOpInstances) {
+                          String problemSizes, String problemConfigs,
+                          String multiAbdConfigs, String perOpInstances) {
     // All operators whose CMakeLists list both gfx942 and gfx950 in DESIRED_TARGETS
-    // run on both arches. Two sets remain gfx950-only:
+    // run on both arches. Two ops remain gfx950-only:
     //
-    //   gemm_aquant / gemm_bquant / gemm_abquant: SUPPORTED_ARCHS = ("gfx950",) in
-    //     their Python layers. The C++ side would compile on gfx942 (standard fp8
-    //     MFMA), but the Python guards have not been lifted yet. Widening is its own
-    //     change; the gate is conservative and likely to lift soon.
+    //   gemm_bquant: gemm_bquant_utils pins _NAME_ONLY_GFX_ARCH = "gfx950" and its
+    //     _MX_VARIANTS hard-require gfx950. gemm_aquant and gemm_abquant used to
+    //     sit here on the claim that all three had SUPPORTED_ARCHS = ("gfx950",);
+    //     that was never true of those two (gemm_aquant_utils allows
+    //     gfx90a/gfx942/gfx950, gemm_abquant_utils gfx942/gfx950), so they now run
+    //     on both arches alongside the correctness lane.
     //
     //   mx_gemm: CMakeLists filters with `target MATCHES "^gfx950"`, so
     //     benchmark_mx_gemm_all is never created for gfx942 and ninja would fail on
     //     an unknown target. Also has no fp16 path (MX_GEMM_DATATYPE defaults to
     //     fp4;fp8), hence quantDatatype below.
     //
-    // gemm_preshuffle and contraction_multi_abd are deferred: preshuffle has no
-    // dispatcher bridge on develop; contraction_multi_abd has no Python benchmark
-    // driver. Both get lanes in the next PR once those prerequisites land.
+    // gemm_preshuffle, gemm_rowcolquant, gemm_tensor_quant and contraction_multi_abd
+    // are no longer deferred: the bridges landed on develop (#10439), preshuffle
+    // rides gemm_utils.py via variant="preshuffle" rather than needing its own
+    // bridge, and contraction_multi_abd_benchmark.py is now written.
+    //
+    // Every op below MUST carry an explicit <OP>_MAX_INSTANCES -- see the budget
+    // comment in runDispatcherPerfTests. Omitting it on one op re-divides the
+    // shared TILE_ENGINE_SAMPLING_TIER pool and silently shrinks coverage for
+    // every other op in the lane.
+    //
+    // TEMPORARY -- GEMM_PRESHUFFLE_CONFIG_FILE below pins gemm_preshuffle to its
+    // small configs/default_ci_config.json instead of the default_config.json
+    // sweep. Remove that one -D line once the compiler fix lands.
+    //
+    // clang-23 in the ROCm 10.0 image recurses without bound inside the
+    // amdgpu-attributor pass on some preshufflev2 instances:
+    // Attributor::getAssumedSimplifiedValues -> AAPotentialValuesFloating::updateImpl
+    // -> Attributor::updateAA -> getOrCreateAAFor<AAPotentialValues> -> repeat,
+    // for ~250 frames until the 8 MB cc1 thread stack is gone. clang dies with
+    // SIGSEGV and ninja reports [code=134], so the lane is red before a single
+    // benchmark runs. Six targets took it down in PR-12521 build #3 (gfx950):
+    //   192x64x128_2x2x1_16x16x16, 192x128x128_2x2x1_16x16x16,
+    //   192x256x64_1x4x1_32x32x8 (both persistent variants),
+    //   256x64x128_2x2x1_16x16x16, 256x128x64_1x4x1_16x16x16.
+    //
+    // Pinning the config rather than capping tile_m, because tile_m does not
+    // separate the crashing shapes from the healthy ones: 24 of the 58 instances
+    // that build reached had tile_m >= 192 and only 6 crashed --
+    // 192x192x64_2x2x1_16x16x16 and 256x256x64_2x2x1_16x16x16 compile fine.
+    // Neither m_repeat nor k_repeat nor their product draws the line either.
+    // There is no sound CK-side predicate here, so the honest mitigation is a
+    // small known-good instance set, not a guess dressed up as a filter.
+    //
+    // Not gated on gfx950 either, even though that is the only arch observed to
+    // crash: tile_engine/sampling/seed.py seeds the sample from the DATE and the
+    // target, so gfx942 simply draws a different 64 each day and has no claim to
+    // being safe. Same mechanism CONTRACTION_MULTI_ABD_CONFIG_FILE already uses
+    // below. Cost is coverage, not signal: the lane still codegens, builds, links
+    // and launches the operator, which is what it exists to prove. The CI config
+    // yields 4 instances on both arches (verified with --list_kernels), so
+    // benchmark_gemm_preshuffle_all stays non-empty and the driver still has
+    // kernels to discover.
     def cmd = """
             cmake -G Ninja -D CMAKE_PREFIX_PATH=/opt/rocm \
                 -D BUILD_CK_TILE_ENGINE="ON" \
@@ -1457,27 +1590,41 @@ String _dispatcherPerfCmd(String compiler, String gpuTarget, String samplingTier
                 -D GROUPED_GEMM_ROWCOLQUANT_MAX_INSTANCES=${perOpInstances} \
                 -D GROUPED_GEMM_TENSORQUANT_DATATYPE="${quantDatatype}" \
                 -D GROUPED_GEMM_TENSORQUANT_LAYOUT="${quantLayout}" \
-                -D GROUPED_GEMM_TENSORQUANT_MAX_INSTANCES=${perOpInstances}"""
-    if (gpuTarget == "gfx950") {
-        cmd += """ \
+                -D GROUPED_GEMM_TENSORQUANT_MAX_INSTANCES=${perOpInstances} \
+                -D GEMM_ROWCOLQUANT_DATATYPE="${quantDatatype}" \
+                -D GEMM_ROWCOLQUANT_LAYOUT="${quantLayout}" \
+                -D GEMM_ROWCOLQUANT_MAX_INSTANCES=${perOpInstances} \
+                -D GEMM_TENSOR_QUANT_DATATYPE="${quantDatatype}" \
+                -D GEMM_TENSOR_QUANT_LAYOUT="${quantLayout}" \
+                -D GEMM_TENSOR_QUANT_MAX_INSTANCES=${perOpInstances} \
+                -D GEMM_PRESHUFFLE_DATATYPE="${gemmDatatype}" \
+                -D GEMM_PRESHUFFLE_LAYOUT="${gemmLayout}" \
+                -D GEMM_PRESHUFFLE_MAX_INSTANCES=${perOpInstances} \
+                -D GEMM_PRESHUFFLE_CONFIG_FILE=default_ci_config.json \
                 -D GEMM_AQUANT_DATATYPE="${quantDatatype}" \
                 -D GEMM_AQUANT_LAYOUT="${quantLayout}" \
                 -D GEMM_AQUANT_MAX_INSTANCES=${perOpInstances} \
-                -D GEMM_BQUANT_DATATYPE="${quantDatatype}" \
-                -D GEMM_BQUANT_LAYOUT="${quantLayout}" \
-                -D GEMM_BQUANT_MAX_INSTANCES=${perOpInstances} \
                 -D GEMM_ABQUANT_DATATYPE="${quantDatatype}" \
                 -D GEMM_ABQUANT_LAYOUT="${quantLayout}" \
                 -D GEMM_ABQUANT_MAX_INSTANCES=${perOpInstances} \
+                -D CONTRACTION_MULTI_ABD_DATATYPE="fp16" \
+                -D CONTRACTION_MULTI_ABD_LAYOUT="rcr" \
+                -D CONTRACTION_MULTI_ABD_MAX_INSTANCES=${perOpInstances} \
+                -D CONTRACTION_MULTI_ABD_CONFIG_FILE=smoke_ci_config.json"""
+    if (gpuTarget == "gfx950") {
+        cmd += """ \
+                -D GEMM_BQUANT_DATATYPE="${quantDatatype}" \
+                -D GEMM_BQUANT_LAYOUT="${quantLayout}" \
+                -D GEMM_BQUANT_MAX_INSTANCES=${perOpInstances} \
                 -D MX_GEMM_DATATYPE="${quantDatatype}" \
                 -D MX_GEMM_LAYOUT="${quantLayout}" \
                 -D MX_GEMM_MAX_INSTANCES=${perOpInstances}"""
     }
     cmd += """ \
                 -D TILE_ENGINE_SAMPLING_TIER=${samplingTier} .. && \
-            ninja -j\$(nproc) benchmark_gemm_universal_all benchmark_batched_gemm_all benchmark_batched_contraction_all benchmark_gemm_streamk_all benchmark_grouped_gemm_all benchmark_gemm_multi_d_all benchmark_gemm_multi_abd_all benchmark_grouped_gemm_rowcolquant_all benchmark_grouped_gemm_tensorquant_all"""
+            ninja -j\$(nproc) benchmark_gemm_universal_all benchmark_batched_gemm_all benchmark_batched_contraction_all benchmark_gemm_streamk_all benchmark_grouped_gemm_all benchmark_gemm_multi_d_all benchmark_gemm_multi_abd_all benchmark_grouped_gemm_rowcolquant_all benchmark_grouped_gemm_tensorquant_all benchmark_gemm_rowcolquant_all benchmark_gemm_tensor_quant_all benchmark_gemm_preshuffle_all benchmark_gemm_aquant_all benchmark_gemm_abquant_all benchmark_contraction_multi_abd_all"""
     if (gpuTarget == "gfx950") {
-        cmd += " benchmark_gemm_aquant_all benchmark_gemm_bquant_all benchmark_gemm_abquant_all benchmark_mx_gemm_all"
+        cmd += " benchmark_gemm_bquant_all benchmark_mx_gemm_all"
     }
     cmd += """ && \
             python3 ../tile_engine/ops/gemm/gemm_universal/gemm_universal_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_universal_results.json && \
@@ -1488,15 +1635,32 @@ String _dispatcherPerfCmd(String compiler, String gpuTarget, String samplingTier
             python3 ../tile_engine/ops/gemm/gemm_multi_d/gemm_multi_d_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_multi_d_results.json && \
             python3 ../tile_engine/ops/gemm/gemm_multi_abd/gemm_multi_abd_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_multi_abd_results.json && \
             python3 ../tile_engine/ops/gemm/grouped_gemm_quant/grouped_gemm_rowcolquant/grouped_gemm_rowcolquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json grouped_gemm_rowcolquant_results.json && \
-            python3 ../tile_engine/ops/gemm/grouped_gemm_quant/grouped_gemm_tensorquant/grouped_gemm_tensorquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json grouped_gemm_tensorquant_results.json"""
+            python3 ../tile_engine/ops/gemm/grouped_gemm_quant/grouped_gemm_tensorquant/grouped_gemm_tensorquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json grouped_gemm_tensorquant_results.json && \
+            python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_rowcolquant/gemm_rowcolquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_rowcolquant_results.json && \
+            python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_tensor_quant/gemm_tensor_quant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_tensor_quant_results.json && \
+            python3 ../tile_engine/ops/gemm/gemm_preshuffle/gemm_preshuffle_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_preshuffle_results.json && \
+            python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_aquant/gemm_aquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_aquant_results.json && \
+            python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_abquant/gemm_abquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_abquant_results.json && \
+            python3 ../tile_engine/ops/gemm/contraction_multi_abd/contraction_multi_abd_benchmark.py . --problem-configs ${multiAbdConfigs} --warmup 5 --repeat 5 --verbose --json contraction_multi_abd_results.json"""
     if (gpuTarget == "gfx950") {
         cmd += """ && \
-            python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_aquant/gemm_aquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_aquant_results.json && \
             python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_bquant/gemm_bquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_bquant_results.json && \
-            python3 ../tile_engine/ops/gemm/block_scale_gemm/gemm_abquant/gemm_abquant_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json gemm_abquant_results.json && \
             python3 ../tile_engine/ops/gemm/mx_gemm/mx_gemm_benchmark.py . --problem-sizes ${problemSizes} --warmup 5 --repeat 5 --verbose --json mx_gemm_results.json"""
     }
     return cmd
+}
+
+// Archive a dispatcher lane's result JSON as <arch>_<name>. The gfx942 and gfx950
+// lanes are parallel branches of one build writing the same names, and Jenkins
+// keeps one artifact per path, so unprefixed the last lane silently replaces the
+// other arch's results (tile_engine JSON has no arch field). Paths are spelled
+// out because execute_cmd runs in the build dir while archiveArtifacts resolves
+// against the workspace root. Never throws: callers are finally blocks, where on
+// a cmake/ninja failure no JSON exists and a throw would mask the real error.
+def archiveArchResults(String arch, String glob) {
+    def buildDir = "projects/composablekernel/build"
+    sh(returnStatus: true, script: "cd ${buildDir} && for f in ${glob}; do mv \"\$f\" \"${arch}_\$f\"; done")
+    archiveArtifacts artifacts: "${buildDir}/${arch}_${glob}", allowEmptyArchive: true
 }
 
 // Benchmark ahead-of-time tile_engine instances at smoke coverage: one dtype,
@@ -1516,6 +1680,16 @@ def runDispatcherPerfTests(String compiler, String gpuTarget = "gfx942") {
     def gemmLayout     = "rcr"
     def problemSizes   = '"1024,1024,1024"'
     def problemConfigs = '"g=2;m=1024;n=1024;k=1024"'
+    // contraction_multi_abd cannot share problemConfigs above. Its kernels are
+    // compiled with CONTRACTION_MULTI_ABD_NUM_DIM_M/N = 2 (CMakeLists defaults,
+    // baked into the kernel name as g1_m2_n2_k1), and the executable rejects a
+    // dim list whose LENGTH differs from the compiled count -- "m=1024" is one M
+    // dimension where the kernel wants two, which is EXIT_FAILURE for every
+    // kernel, not a smaller problem. Extents are the product of each list, so
+    // m=4,256 is M=1024: same 1024^2 x 64 problem, expressed at the right arity.
+    // 1024 is also a multiple of the smoke config's 256x256x64 tile, which has
+    // pad_m/n/k all false.
+    def multiAbdConfigs = '"g=2;m=4,256;n=4,256;k=64"'
     // gemm_multi_d and gemm_multi_abd take 4-character layouts (A, B, D, E),
     // not the 3-character rcr the other ops use. Passing rcr here is not a
     // narrower selection, it is a parse error in the instance builder.
@@ -1540,34 +1714,39 @@ def runDispatcherPerfTests(String compiler, String gpuTarget = "gfx942") {
     //
     //   Both arches: gemm_universal, batched_gemm, batched_contraction,
     //     gemm_streamk, grouped_gemm, gemm_multi_d, gemm_multi_abd,
-    //     grouped_gemm_rowcolquant, grouped_gemm_tensorquant.
-    //     All have gfx950 in their DESIRED_TARGETS and no Python-level arch gate.
+    //     grouped_gemm_rowcolquant, grouped_gemm_tensorquant, gemm_rowcolquant,
+    //     gemm_tensor_quant, gemm_preshuffle, gemm_aquant, gemm_abquant,
+    //     contraction_multi_abd.
+    //     All have gfx950 in their DESIRED_TARGETS and no Python-level arch gate
+    //     that excludes gfx942.
     //
-    //   gfx950 only: gemm_aquant, gemm_bquant, gemm_abquant, mx_gemm.
-    //     gemm_aquant/bquant/abquant: SUPPORTED_ARCHS = ("gfx950",) in the Python
-    //     layer. gfx942 has fp8 (FNUZ), but those guards haven't been lifted yet.
+    //   gfx950 only: gemm_bquant, mx_gemm.
+    //     gemm_bquant: gemm_bquant_utils pins _NAME_ONLY_GFX_ARCH = "gfx950" and
+    //     its _MX_VARIANTS hard-require gfx950.
     //     mx_gemm: CMakeLists filters with `target MATCHES "^gfx950"`, so the
     //     benchmark_mx_gemm_all target is never created for gfx942; also has no
     //     fp16 path, hence quantDatatype below.
     //
-    //   Deferred (next PR): gemm_preshuffle (no bridge on develop), and
-    //     contraction_multi_abd (no Python benchmark driver yet).
+    // contraction_multi_abd is the one op whose CI config is named
+    // smoke_ci_config.json rather than default_ci_config.json, so it is selected
+    // explicitly via CONTRACTION_MULTI_ABD_CONFIG_FILE. It also takes
+    // --problem-configs (g/m/n/k), not --problem-sizes, like batched_contraction
+    // -- but with its own multiAbdConfigs, for the dim-arity reason noted above.
     def quantDatatype  = "fp8"
     def quantLayout    = "rcr"
     // Stream-K below is tile_engine/ops/gemm_streamk/ (top level), not
-    // tile_engine/ops/gemm/gemm_streamk/. Two paths exist and only the first is
-    // real: it holds the CMakeLists, the instance builder and the benchmark. The
-    // nested one contains a lone configs/default_config.json that nothing in the
-    // tree reads. Edit the top-level tree.
-    def execute_cmd = _dispatcherPerfCmd(compiler, gpuTarget, samplingTier, gemmDatatype, gemmLayout, multiLayout, quantDatatype, quantLayout, problemSizes, problemConfigs, perOpInstances)
+    // tile_engine/ops/gemm/gemm_streamk/. Two paths exist: the top-level tree is
+    // the native Tile Engine build this lane runs (CMakeLists, instance builder,
+    // benchmark). The nested one holds only configs/default_config.json, which is
+    // the default sweep of the Dispatcher bridge driver
+    // (tile_engine/ops/gemm/streamk_gemm_full_benchmark.py), not of this lane.
+    // Edit the top-level tree to change what this lane builds.
+    def execute_cmd = _dispatcherPerfCmd(compiler, gpuTarget, samplingTier, gemmDatatype, gemmLayout, multiLayout, quantDatatype, quantLayout, problemSizes, problemConfigs, multiAbdConfigs, perOpInstances)
     try {
         buildAndTest(setup_args: "NO_CK_BUILD", build_type: 'Release', execute_cmd: execute_cmd)
     } finally {
         // finally, not a trailing call: a red lane is exactly when the per-kernel
-        // JSON is worth having, and buildAndTest throws on failure. Same path
-        // reasoning as runDispatcherCorrectnessTests: execute_cmd runs from
-        // projects/composablekernel/build while archiveArtifacts resolves against
-        // the workspace root, so the build-relative path is spelled out in full.
+        // JSON is worth having, and buildAndTest throws on failure.
         //
         // *_results.json, NOT dispatcher_*: this lane drives tile_engine's own
         // benchmark drivers, and every file it produces is a tile_engine JSON
@@ -1576,14 +1755,11 @@ def runDispatcherPerfTests(String compiler, String gpuTarget = "gfx942") {
         // writes those -- so the narrower glob matched zero files and
         // allowEmptyArchive turned that into a silent success.
         //
-        // allowEmptyArchive stays true only because this is a finally block: on a
-        // cmake/ninja failure no JSON exists yet, and a throwing archive step
-        // would mask the real exception. The signal that the run actually
-        // produced results comes from the drivers, which now exit non-zero when
-        // no kernels were discovered or the result set is empty, and record
-        // launches_attempted/succeeded/failed in each JSON.
-        archiveArtifacts artifacts: "projects/composablekernel/build/*_results.json",
-                         allowEmptyArchive: true
+        // The signal that the run actually produced results comes from the
+        // drivers, which exit non-zero when no kernels were discovered or the
+        // result set is empty, and record launches_attempted/succeeded/failed in
+        // each JSON.
+        archiveArchResults(gpuTarget, "*_results.json")
     }
 }
 
@@ -1690,7 +1866,7 @@ def dispatcherVariantCmd(String arch, String variant) {
 // deeply. gfx950 runs 2 dtypes x 4 layouts -- see dispatcherSweepDtypesFor.
 //
 // ---------------------------------------------------------------------------
-// Coverage against the 13 dispatcher operators with a bridge on develop.
+// Coverage against the 20 dispatcher operators with a bridge on develop.
 //
 // Operators covered by this lane (all grouped_gemm / dispatcher-bridge variants):
 //   gemm_universal, grouped_gemm, multi_d_gemm (4 layouts), multi_abd_gemm,
@@ -1703,12 +1879,21 @@ def dispatcherVariantCmd(String arch, String variant) {
 // limitation (no scale-MFMA builtins on gfx942), bquant C4/C pending one
 // validating gfx942 run. See the gate comment further down.
 //
-// Operators NOT covered by this lane (no dispatcher bridge on develop yet):
-//   preshuffled_gemm, gemm_aquant, gemm_abquant, gemm_bquant,
-//   gemm_rowcolquant, gemm_tensorquant (block_scale_gemm tile_engine ops),
+// Also covered, added once their bridges landed on develop (#10439):
+//   gemm_rowcolquant, gemm_tensorquant, gemm_aquant, gemm_abquant (both
+//   arches), gemm_bquant (gfx950 only), preshuffled_gemm,
 //   batched_contraction_multi_abd.
 //
-// All 13 bridged ops are invoked. Twelve are fully covered; one
+// NAMING TRAP -- the single-GEMM and grouped ops differ by one token and sit on
+// adjacent lines in the chain below. They are different tests against different
+// bridges, and neither substitutes for the other:
+//   test_rowcolquant_*      / test_tensorquant_*   -> GROUPED  (grouped_gemm_*_utils)
+//   test_gemm_rowcolquant_* / test_tensor_quant_*  -> single GEMM (gemm_*_utils)
+//   test_{a,ab,b}quant_*      -> GROUPED  (grouped_gemm_{a,ab,b}quant_utils)
+//   test_gemm_{a,ab,b}quant_* -> single GEMM (gemm_{a,ab,b}quant_utils)
+// Deleting a "duplicate-looking" line here silently drops a whole operator.
+//
+// All 20 bridged ops are invoked. Nineteen are fully covered; one
 // (grouped_gemm_bquant non-rcr layouts) runs but over a narrowed surface.
 //
 // One non-obvious detail: gemm_universal's int8 coverage comes from
@@ -1731,14 +1916,16 @@ def dispatcherVariantCmd(String arch, String variant) {
 String _dispatcherCorrectnessBaseCmd(String arch, String compiler, String dtypes, int budget) {
     return """
         run_ok() { rc=0; "\$@" || rc=\$?; if [ \$rc -eq 77 ]; then echo "SKIP(77): \$*"; return 0; fi; return \$rc; } && \
+        pip3 install --target /tmp/ci_py_pkgs --quiet ml_dtypes==0.6.0 && \
+        export PYTHONPATH=/tmp/ci_py_pkgs\${PYTHONPATH:+:\$PYTHONPATH} && \
         cmake -G Ninja -D CMAKE_PREFIX_PATH=/opt/rocm \
             -D CMAKE_CXX_COMPILER="${compiler}" \
+            -D CMAKE_HIP_COMPILER="${compiler}" \
             -D CMAKE_BUILD_TYPE=Release \
             -D GPU_TARGETS="${arch}" \
-            -D CK_TILE_DISPATCHER=ON \
-            -D BUILD_DISPATCHER_BINDINGS=ON \
-            -D DISPATCHER_RULE_SET=tests .. && \
-        ninja -j\$(nproc) ck_tile_dispatcher dispatcher_gemm_lib && \
+            -S ../dispatcher \
+            -B ../dispatcher/build && \
+        ninja -C ../dispatcher/build -j\$(nproc) ck_tile_dispatcher && \
         python3 ../dispatcher/tests/test_gemm_search_space.py \
             --arch ${arch} \
             --dtypes ${dtypes} \
@@ -1755,7 +1942,11 @@ String _dispatcherCorrectnessBaseCmd(String arch, String compiler, String dtypes
         run_ok python3 ../dispatcher/tests/test_multi_d_gpu_correctness.py --gfx ${arch} && \
         run_ok python3 ../dispatcher/tests/test_multi_abd_gpu_correctness.py && \
         run_ok python3 ../dispatcher/tests/test_rowcolquant_gpu_correctness.py --gfx ${arch} && \
-        run_ok python3 ../dispatcher/tests/test_tensorquant_gpu_correctness.py --gfx ${arch}"""
+        run_ok python3 ../dispatcher/tests/test_tensorquant_gpu_correctness.py --gfx ${arch} && \
+        run_ok python3 ../dispatcher/tests/test_gemm_rowcolquant_gpu_correctness.py --gfx ${arch} && \
+        run_ok python3 ../dispatcher/tests/test_tensor_quant_gpu_correctness.py --gfx ${arch} && \
+        run_ok python3 ../dispatcher/tests/test_preshuffle_gpu_correctness.py --gfx ${arch} && \
+        run_ok python3 ../dispatcher/tests/test_contraction_multi_abd_gpu_correctness.py --gfx ${arch}"""
 }
 
 def runDispatcherCorrectnessTests(String arch, String compiler) {
@@ -1815,9 +2006,15 @@ def runDispatcherCorrectnessTests(String arch, String compiler) {
     // instead runs the two-config smoke test merged in #10132. That test is
     // unittest-based and self-gates to gfx950, so it takes no --gfx. It is still
     // wrapped with run_ok -- see the NOTE below for why every test in this chain is.
+    //
+    // test_gemm_bquant_gpu_correctness.py (single GEMM, gemm_bquant_utils) is
+    // gated here for the same reason as its grouped counterpart on the line
+    // above: gemm_bquant_utils pins _NAME_ONLY_GFX_ARCH = "gfx950" and its
+    // _MX_VARIANTS hard-require gfx950. The two gates must move together.
     if (arch == "gfx950") {
         execute_cmd += """ && \
         run_ok python3 ../dispatcher/tests/test_bquant_gpu_correctness.py --gfx ${arch} && \
+        run_ok python3 ../dispatcher/tests/test_gemm_bquant_gpu_correctness.py --gfx ${arch} && \
         run_ok python3 ../dispatcher/tests/test_mx_gemm_gpu_correctness.py"""
     }
     // aquant runs on both archs. Its non-preshuffleaq builders use standard fp8
@@ -1835,6 +2032,14 @@ def runDispatcherCorrectnessTests(String arch, String compiler) {
     // pending one green run, and reports that as a per-case SKIP, not a 77.
     execute_cmd += """ && \
         run_ok python3 ../dispatcher/tests/test_abquant_gpu_correctness.py --gfx ${arch}"""
+    // The single-GEMM aquant/abquant bridges (gemm_aquant_utils,
+    // gemm_abquant_utils -- distinct from the grouped_gemm_* ones above) both
+    // list gfx942 in _SUPPORTED_ARCHS, so they run on both arches too. Their
+    // fp8 host codec goes through dispatcher_common.fp8_uses_ocp rather than a
+    // local copy, so the FNUZ/OCP split follows the compiled arch.
+    execute_cmd += """ && \
+        run_ok python3 ../dispatcher/tests/test_gemm_aquant_gpu_correctness.py --gfx ${arch} && \
+        run_ok python3 ../dispatcher/tests/test_gemm_abquant_gpu_correctness.py --gfx ${arch}"""
     // NOTE: run_ok is applied to every script-style test AND every unittest-based
     // test above. Unittest-based tests exit 0 on an internal skipTest, but a bad
     // import or setUpClass crash still exits 1, which would break the && chain and
@@ -1845,14 +2050,8 @@ def runDispatcherCorrectnessTests(String arch, String compiler) {
     } finally {
         // finally, not a trailing call: a red lane is exactly when the per-kernel
         // JSON is worth having, and buildAndTest throws on failure.
-        //
-        // Path, not a bare glob: cmake_build runs execute_cmd from
-        // projects/composablekernel/build, while archiveArtifacts resolves
-        // against the workspace root. A bare "dispatcher_*_results.json" matches
-        // nothing there, and allowEmptyArchive hides that it matched nothing.
         // Glob, not one name: each variant writes its own dispatcher_<v>_*.json.
-        archiveArtifacts artifacts: "projects/composablekernel/build/dispatcher_*_results.json",
-                         allowEmptyArchive: true
+        archiveArchResults(arch, "dispatcher_*_results.json")
     }
 }
 
@@ -1901,6 +2100,9 @@ def runDispatcherTests(def rocmnode, boolean runCorrectness, boolean runPerf, St
         }
     }
     if (branches) {
+        // `parallelsAlwaysFailFast()` in the Jenkinsfile options block only
+        // applies to declarative parallel, so set failFast explicitly here.
+        branches['failFast'] = true
         parallel branches
     }
 }
@@ -1914,7 +2116,6 @@ def runBuildCKAndTests(String arch) {
     switch (arch) {
         case "gfx90a":
             gpuTarget = "gfx90a"
-            extraSetupArgs = " -DCK_CXX_STANDARD=\"17\""
             execute_cmd = build_client_examples(gpuTarget)
             break
         case "gfx1250":
@@ -1956,4 +2157,3 @@ def runBuildInstancesOnly(String compiler) {
                 -D CMAKE_BUILD_TYPE=Release .. && ninja -j${nthreads()}"""
     )
 }
-

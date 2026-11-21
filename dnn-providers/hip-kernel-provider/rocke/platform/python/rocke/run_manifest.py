@@ -1,10 +1,10 @@
 # Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
 # SPDX-License-Identifier: MIT
 
-"""Python-native CK DSL manifest runner.
+"""Python-native rocKE manifest runner.
 
 This replaces the C++ `example/ck_tile/dsl/common/launcher.cpp` path
-for day-to-day DSL development. The flow:
+for day-to-day rocKE development. The flow:
 
   1. `gen.py` emits a HSACO blob + `manifest.json`.
   2. Python loads the code object with `hipModuleLoadData`.
@@ -25,9 +25,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
+from .benchmark.perf import perfjson
 from .runtime.hip_module import Runtime
 from .instances.common.manifest_runner.gemm import (
     run_batched_gemm_manifest_problem,
+    run_gemm_fp8_manifest_problem,
     run_gemm_iu8_manifest_problem,
     run_gemm_manifest_problem,
 )
@@ -165,6 +167,7 @@ def _register_builtin_runners() -> None:
         register_manifest_runner(kind, run_simple_op_manifest_problem)
     register_manifest_runner("gemm_fp16", run_gemm_manifest_problem)
     register_manifest_runner("gemm_iu8", run_gemm_iu8_manifest_problem)
+    register_manifest_runner("gemm_fp8", run_gemm_fp8_manifest_problem)
     register_manifest_runner("batched_gemm_fp16", run_batched_gemm_manifest_problem)
     register_manifest_runner("matmul_nbits_fp16", run_matmul_nbits_manifest_problem)
     # deep_fused_conv_pool_* and conv_{fp16,bf16,fp32} runners live in the
@@ -192,10 +195,18 @@ def _load(manifest_path: Path, hsaco_path: Optional[Path]):
 
 
 def _launch_timed(
-    rt: Runtime, fn, grid, block, args: bytes, warmup: int, iters: int
+    rt: Runtime,
+    fn,
+    grid,
+    block,
+    args: bytes,
+    warmup: int,
+    iters: int,
+    cluster: Optional[Tuple[int, int, int]] = None,
 ) -> float:
     """Time `iters` repeats of `rt.launch(fn, grid, block, args)` on
-    the default stream.
+    the default stream. `cluster` is the kernel's compiled cluster shape
+    (the manifest's `cluster_dims`), passed to every launch.
 
     Delegates to `rocke.runtime.launcher.time_launches` when torch is
     available, so the manifest runner and the in-tree Launcher abstraction
@@ -208,20 +219,20 @@ def _launch_timed(
     """
     if HAS_TORCH_LAUNCHER:
         return time_launches(
-            lambda: rt.launch(fn, grid, block, args),
+            lambda: rt.launch(fn, grid, block, args, cluster=cluster),
             warmup=warmup,
             iters=iters,
         )
     else:
         # Fallback: Direct HIP event timing (torch-free)
         for _ in range(warmup):
-            rt.launch(fn, grid, block, args)
+            rt.launch(fn, grid, block, args, cluster=cluster)
         rt.sync()
         e0 = rt.event()
         e1 = rt.event()
         e0.record()
         for _ in range(iters):
-            rt.launch(fn, grid, block, args)
+            rt.launch(fn, grid, block, args, cluster=cluster)
         e1.record()
         e1.synchronize()
         total_ms = e0.elapsed_to(e1)
@@ -250,7 +261,17 @@ def run_manifest(
     args, ptrs = make_args(rt)
     warmup = int(manifest.get("warmup_iters", 5))
     iters = int(manifest.get("timed_iters", 100))
-    ms = _launch_timed(rt, fn, grid, block, args, warmup, iters)
+    cluster = manifest.get("cluster_dims")
+    ms = _launch_timed(
+        rt,
+        fn,
+        grid,
+        block,
+        args,
+        warmup,
+        iters,
+        None if cluster is None else tuple(cluster),
+    )
     max_abs_diff, bad_count, total = check(rt, ptrs)
     for ptr in ptrs:
         rt.free(ptr)
@@ -293,21 +314,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(
         f"Perf: {summary.ms:.6g} ms, {summary.tflops:.6g} TFlops, {summary.gbps:.6g} GB/s"
     )
-    # Machine-readable line for tooling in the same package (e.g. the GEMM
-    # sweep harness). Parse this rather than the human "Perf:" string so that
-    # formatting changes above never silently drop metrics.
-    print(
-        "PerfJSON: "
-        + json.dumps(
-            {
-                "ms": summary.ms,
-                "tflops": summary.tflops,
-                "gbps": summary.gbps,
-                "max_abs_diff": summary.max_abs_diff,
-                "bad_count": summary.bad_count,
-                "total": summary.total,
-            }
-        )
+    # Machine-readable line for any tool measuring this command (the GEMM sweep
+    # harness, rocke.benchmark.perf). Parse this rather than the human "Perf:"
+    # string so that formatting changes above never silently drop metrics.
+    perfjson.emit(
+        ms=summary.ms,
+        tflops=summary.tflops,
+        gbps=summary.gbps,
+        max_abs_diff=summary.max_abs_diff,
+        bad_count=summary.bad_count,
+        total=summary.total,
     )
     if ns.verify and summary.bad_count:
         return 1

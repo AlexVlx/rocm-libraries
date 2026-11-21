@@ -10,6 +10,7 @@
 #include "HipdnnException.hpp"
 #include "NodeFactory.hpp"
 #include "PlatformUtils.hpp"
+#include "SdpaFwdOperationDescriptor.hpp"
 
 #include <functional>
 #include <hipdnn_flatbuffers_sdk/utilities/FlatbufferUtils.hpp>
@@ -159,10 +160,7 @@ std::unique_ptr<hipdnn_flatbuffers_sdk::data_objects::GraphT>
             graph->tensors, [](const auto& tensor) { return tensor.get(); });
 
     const auto& requiredVersion
-        = hipdnn_plugin_sdk::computeMinimumEnginePluginApiVersion(_isOverrideShapeEnabled,
-                                                                  anyRuntimePassByValue,
-                                                                  hasRaggedTensors(),
-                                                                  hasNonDefaultTensorAlignment());
+        = requiredEngineApiVersion(_isOverrideShapeEnabled, anyRuntimePassByValue);
     graph->min_required_engine_api_version
         = std::make_unique<hipdnn_flatbuffers_sdk::data_objects::EngineApiVersion>(
             hipdnn_plugin_sdk::toEngineApiVersion(requiredVersion));
@@ -684,9 +682,62 @@ bool GraphDescriptor::hasNonDefaultTensorAlignment() const
     return false;
 }
 
+bool GraphDescriptor::hasRaggedOffsetMultiplier() const
+{
+    // Source of truth: tensor_attributes.fbs -> `ragged_offset_multiplier: long = 1`.
+    static constexpr int64_t K_DEFAULT_RAGGED_OFFSET_MULTIPLIER = 1;
+    for(const auto& desc : _operations)
+    {
+        const auto* op = desc->asGraphOperation();
+        for(const auto& tensorDesc : op->getTensorDescriptors())
+        {
+            if(tensorDesc->getData().ragged_offset_multiplier != K_DEFAULT_RAGGED_OFFSET_MULTIPLIER)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+const hipdnn_data_sdk::utilities::Version&
+    GraphDescriptor::requiredEngineApiVersion(bool isOverrideShapeEnabled,
+                                              bool isRuntimePassByValue) const
+{
+    return hipdnn_plugin_sdk::computeMinimumEnginePluginApiVersion(isOverrideShapeEnabled,
+                                                                   isRuntimePassByValue,
+                                                                   hasRaggedTensors(),
+                                                                   hasNonDefaultTensorAlignment(),
+                                                                   hasRaggedOffsetMultiplier(),
+                                                                   hasCuSeqLen());
+}
+
+bool GraphDescriptor::hasCuSeqLen() const
+{
+    for(const auto& desc : _operations)
+    {
+        // Backend builds with -fno-rtti, so dispatch on the descriptor type and static_cast.
+        if(desc->getType() != HIPDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR)
+        {
+            continue;
+        }
+        const auto& data = static_cast<const SdpaFwdOperationDescriptor&>(*desc).getData();
+        if(data.cu_seq_len_q_tensor_uid.has_value() || data.cu_seq_len_kv_tensor_uid.has_value())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool GraphDescriptor::isRuntimePassByValueEnabled() const
 {
     return _isRuntimePassByValueEnabled;
+}
+
+std::optional<std::array<uint8_t, 16>> GraphDescriptor::getGraphId() const
+{
+    return _graphId;
 }
 
 std::string GraphDescriptor::toString() const

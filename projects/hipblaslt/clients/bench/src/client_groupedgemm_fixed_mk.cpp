@@ -24,6 +24,7 @@
  *
  *******************************************************************************/
 
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -300,7 +301,23 @@ static int parse_arguments(int                          argc,
                 else if(arg == "--initialization")
                 {
                     std::string initializationStr = argv[++i];
-                    initialization = string2hipblaslt_initialization(initializationStr);
+                    auto        parsed = string2hipblaslt_initialization(initializationStr);
+                    if(!parsed)
+                    {
+                        std::cerr << "Invalid initialization type: " << initializationStr << '\n';
+                        return EXIT_FAILURE;
+                    }
+                    // initialize_a_b_c_bias has no maf1_0 or maf2_0 fill; reject instead of
+                    // leaving buffers unfilled.
+                    if(*parsed == hipblaslt_initialization::maf1_0
+                       || *parsed == hipblaslt_initialization::maf2_0
+                       || *parsed == hipblaslt_initialization::maf2_0_unit_scale)
+                    {
+                        std::cerr << "Initialization " << initializationStr
+                                  << " is not supported by this client; use hipblaslt-bench\n";
+                        return EXIT_FAILURE;
+                    }
+                    initialization = *parsed;
                 }
                 else if(arg == "--sync_count")
                 {
@@ -1070,7 +1087,7 @@ int test_hipblaslt(hipDataType                 in_datatype,
                                             hd[i][i1 + i2 * ldd[i] + i3 * stride_d[i]]))
                             {
                                 printf(
-                                    "Err: Index %ld: %f vs %f\n",
+                                    "Err: Index %" PRId64 ": %f vs %f\n",
                                     i1 + i2 * ldd[i] + i3 * stride_d[i],
                                     static_cast<float>(
                                         hd_gold[i][i1 + i2 * ldd[i] + i3 * stride_d[i]]),

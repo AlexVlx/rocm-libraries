@@ -1,5 +1,5 @@
 /* ************************************************************************
- * Copyright (C) 2018-2024 Advanced Micro Devices, Inc. All rights Reserved.
+ * Copyright (C) 2018-2026 Advanced Micro Devices, Inc. All rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -58,10 +58,10 @@ namespace rocalution
   *                     std::complex<double>
   *
   * A number of matrix formats are supported. These are CSR, BCSR, MCSR, COO, DIA, ELL, HYB, and DENSE.
-  * \note For CSR type matrices, the column indices must be sorted in increasing order. For COO matrices, the row
-  * indices must be sorted in increasing order. The function \p Check can be used to check whether a matrix
-  * contains valid data. For CSR and COO matrices, the function \p Sort can be used to sort the row or column
-  * indices respectively.
+  * \note For CSR type matrices, the column indices must be sorted in increasing order. For COO matrices, the
+  * entries must be sorted by row index and, within each row, by column index. The function \p Check can be used
+  * to check whether a matrix contains valid data. For CSR and COO matrices, the function \p Sort can be used to
+  * sort the indices.
   */
     template <typename ValueType>
     class LocalMatrix : public Operator<ValueType>
@@ -234,7 +234,9 @@ namespace rocalution
       * \details
       * \p LeaveDataPtr functions have direct access to the raw data via pointers. A
       * LocalMatrix object can leave its raw data to host pointers. This will leave the
-      * LocalMatrix empty.
+      * LocalMatrix empty. \p LeaveDataPtrBCSR returns the block dimension in \p blockdim,
+      * and the matrix keeps it. A matrix that is not BCSR yet is first converted to BCSR
+      * with the block dimension \p blockdim.
       *
       * \par Example
       * \code{.cpp}
@@ -809,13 +811,19 @@ namespace rocalution
         /** \brief Move all data (i.e. move the matrix) to the accelerator */
         ROCALUTION_EXPORT
         virtual void MoveToAccelerator(void);
-        /** \brief Move all data (i.e. move the matrix) to the accelerator asynchronously */
+        /** \brief Move all data (i.e. move the matrix) to the accelerator asynchronously
+      * \note
+      * Until \p Sync is called, further calls do nothing, and the matrix must not be modified.
+      */
         ROCALUTION_EXPORT
         virtual void MoveToAcceleratorAsync(void);
         /** \brief Move all data (i.e. move the matrix) to the host */
         ROCALUTION_EXPORT
         virtual void MoveToHost(void);
-        /** \brief Move all data (i.e. move the matrix) to the host asynchronously */
+        /** \brief Move all data (i.e. move the matrix) to the host asynchronously
+      * \note
+      * Until \p Sync is called, further calls do nothing, and the matrix must not be modified.
+      */
         ROCALUTION_EXPORT
         virtual void MoveToHostAsync(void);
         /** \brief Synchronize the matrix */
@@ -961,7 +969,12 @@ namespace rocalution
         /** \brief Convert the matrix to MCSR structure */
         ROCALUTION_EXPORT
         void ConvertToMCSR(void);
-        /** \brief Convert the matrix to BCSR structure */
+        /** \brief Convert the matrix to BCSR structure
+      * \details
+      * For a matrix that is not BCSR yet, \p blockdim must be greater than 1. A BCSR
+      * matrix keeps its block dimension for a \p blockdim of 1 or less. A matrix whose
+      * sizes are not a multiple of the block dimension falls back to CSR.
+      */
         ROCALUTION_EXPORT
         void ConvertToBCSR(int blockdim);
         /** \brief Convert the matrix to COO structure */
@@ -979,7 +992,13 @@ namespace rocalution
         /** \brief Convert the matrix to DENSE structure */
         ROCALUTION_EXPORT
         void ConvertToDENSE(void);
-        /** \brief Convert the matrix to specified matrix ID format */
+        /** \brief Convert the matrix to specified matrix ID format
+      * \details
+      * \p blockdim is the block dimension for BCSR. For a matrix that is not BCSR yet, it
+      * must be greater than 1. A BCSR matrix keeps its block dimension for a \p blockdim
+      * of 1 or less. A matrix whose sizes are not a multiple of the block dimension falls
+      * back to CSR.
+      */
         ROCALUTION_EXPORT
         void ConvertTo(unsigned int matrix_format, int blockdim = 1);
 
@@ -1083,15 +1102,19 @@ namespace rocalution
         ROCALUTION_EXPORT
         virtual void Transpose(void);
 
-        /** \brief Transpose the matrix */
+        /** \brief Transpose the matrix into T
+      * \details
+      * T is overwritten and gets the format of this matrix, or CSR if the conversion to
+      * that format fails.
+      */
         ROCALUTION_EXPORT
         void Transpose(LocalMatrix<ValueType>* T) const;
 
         /** \brief Sort the matrix indices
       * \details
       * Sorts the matrix by indices.
-      * - For CSR matrices, column values are sorted.
-      * - For COO matrices, row indices are sorted.
+      * - For CSR matrices, the column indices of each row are sorted.
+      * - For COO matrices, the entries are sorted by row index, then by column index.
       */
         ROCALUTION_EXPORT
         void Sort(void);
@@ -1228,6 +1251,24 @@ namespace rocalution
                                   bool                     FF1,
                                   LocalMatrix<ValueType>*  prolong) const;
 
+        /** \brief Ruge Stueben Ext+i Interpolation, in matrix-matrix formulation */
+        ROCALUTION_EXPORT
+        void RSMMExtPIInterpolation(const LocalVector<int>&  CFmap,
+                                    const LocalVector<bool>& S,
+                                    LocalMatrix<ValueType>*  prolong) const;
+
+        /** \brief Ruge Stueben Ext+e Interpolation, in matrix-matrix formulation */
+        ROCALUTION_EXPORT
+        void RSMMExtPEInterpolation(const LocalVector<int>&  CFmap,
+                                    const LocalVector<bool>& S,
+                                    LocalMatrix<ValueType>*  prolong) const;
+
+        /** \brief Truncate an interpolation operator, keeping at most \p max_elmts entries
+        * per row and dropping those below \p trunc_factor times the largest magnitude of
+        * their row. Surviving entries are rescaled to preserve the row sum. */
+        ROCALUTION_EXPORT
+        void RSInterpolationTruncation(float trunc_factor, int max_elmts);
+
         /** \brief Ruge Stueben Prolongation matrix non-zeros */
         void RSExtPIProlongNnz(int64_t                       global_column_begin,
                                int64_t                       global_column_end,
@@ -1332,6 +1373,11 @@ namespace rocalution
         virtual bool is_accel_(void) const;
 
     private:
+        void RSMMExtInterpolation_(const LocalVector<int>&  CFmap,
+                                   const LocalVector<bool>& S,
+                                   bool                     ext_pe,
+                                   LocalMatrix<ValueType>*  prolong) const;
+
         // Pointer from the base matrix class to the current
         // allocated matrix (host_ or accel_)
         BaseMatrix<ValueType>* matrix_;

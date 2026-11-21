@@ -8,12 +8,23 @@
 //
 // TestConfig is a process-wide singleton initialized exactly once per binary, by
 // whichever suite happens to run first (TestTestConfig.cpp's own comment covers
-// why), so this file cannot pin specific values without racing that ordering.
-// Instead it pins the wiring itself: every HarnessPolicy field must equal the
-// TestConfig getter productionPolicy() is supposed to read, whatever that getter
-// currently returns.
+// why), so a test cannot pin specific values on it without racing that ordering.
+// The first test below pins the wiring itself: every HarnessPolicy field must
+// equal the TestConfig getter productionPolicy() is supposed to read, whatever
+// that getter currently returns. Two fields need more: the settings of an engine
+// file (this binary initializes the singleton without a file), which two tests pin
+// on a TestConfig of their own, and --benchmark-reference, which a death test pins
+// on a fresh singleton; see BenchmarkReferenceReachesConfigAndPolicy.
+
+#include <cstdlib>
 
 #include <gtest/gtest.h>
+
+#include <filesystem>
+#include <fstream>
+#include <utility>
+
+#include <hipdnn_test_sdk/utilities/ScratchDirectory.hpp>
 
 #include "HarnessTestSupport.hpp"
 #include "common/PlatformUtils.hpp"
@@ -44,10 +55,19 @@ TEST_F(TestProductionPolicy, EveryFieldMirrorsItsOwnConfigGetter)
     const HarnessPolicy policy = productionPolicy(TensorPlacement::DEVICE);
 
     EXPECT_EQ(policy.mode, TestConfig::get().getVerificationMode());
-    EXPECT_EQ(policy.enforceSupportClaims, TestConfig::get().enforceSupportClaims());
+    EXPECT_EQ(policy.validator, TestConfig::get().getValidatorDevice());
+    // The one field fed by a helper rather than a getter, and the assertion is
+    // wiring only: this fixture initializes the singleton with the flag false, so
+    // both sides can only ever answer OFF. What it does catch is productionPolicy()
+    // growing a second opinion about the mode instead of deferring to claimMode() --
+    // the header main.cpp prints comes from that same call, and the two disagreeing
+    // would label the run with a mode it did not use.
+    EXPECT_EQ(policy.claims, claimMode());
     EXPECT_EQ(policy.arch, TestConfig::get().getCurrentArch());
     EXPECT_EQ(policy.platform, currentPlatform());
     EXPECT_EQ(policy.deviceVramMb, TestConfig::get().getCurrentDeviceVramMb());
+    EXPECT_EQ(policy.testSettings, TestConfig::get().testSettings());
+    EXPECT_EQ(policy.benchmarkReference, TestConfig::get().benchmarkReference());
 }
 
 TEST_F(TestProductionPolicy, PlacementComesFromTheArgumentNotFromConfig)
@@ -57,6 +77,78 @@ TEST_F(TestProductionPolicy, PlacementComesFromTheArgumentNotFromConfig)
 
     EXPECT_EQ(productionPolicy(TensorPlacement::DEVICE).placement, TensorPlacement::DEVICE);
     EXPECT_TRUE(productionPolicy(TensorPlacement::DEVICE).useDevice());
+}
+
+// The settings file of an engine reaches the harness only through this one field: the coefficient
+// of the float dynamic tolerance and every [[tolerance_overrides]] entry are read from it. A
+// TestConfig of its own, built from a file, shows that production carries what the config
+// loaded, which the process-wide one (initialized without a file in this binary) cannot.
+TEST_F(TestProductionPolicy, SettingsLoadedFromAFileReachThePolicy)
+{
+    const auto dir = hipdnn_test_sdk::utilities::claimScratchDirectory("production_policy");
+    const auto path = dir.path() / "engine.toml";
+    std::ofstream(path) << R"([meta]
+version = 1
+
+[conv_fwd_tolerance.float]
+summation_order = 7.5
+
+[[tolerance_overrides]]
+filters = ["*SomeCase*"]
+atol = 0.5
+rtol = 0.25
+)";
+    TestConfigOptions options;
+    options.configPath = path;
+    const TestConfig config(std::move(options));
+
+    const HarnessPolicy policy = productionPolicy(TensorPlacement::HOST, config);
+
+    ASSERT_NE(policy.testSettings, nullptr);
+    EXPECT_EQ(policy.testSettings, config.testSettings());
+    ASSERT_TRUE(policy.testSettings->convFwdSummationOrder("float").has_value());
+    EXPECT_DOUBLE_EQ(*policy.testSettings->convFwdSummationOrder("float"), 7.5);
+    const auto entry = policy.testSettings->findToleranceOverride("Suite.SomeCase");
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_FLOAT_EQ(entry->atol, 0.5f);
+    EXPECT_FLOAT_EQ(entry->rtol, 0.25f);
+}
+
+TEST_F(TestProductionPolicy, ConfigWithoutAFileGivesAPolicyWithoutSettings)
+{
+    const TestConfig config{TestConfigOptions{}};
+    EXPECT_EQ(productionPolicy(TensorPlacement::HOST, config).testSettings, nullptr);
+}
+
+// The mirror check above can only see the flag off, so it cannot tell a wired
+// --benchmark-reference from one that is dropped or inverted on the way. A
+// threadsafe-style death test re-executes this binary for the statement alone, which
+// gets a TestConfig nobody has initialized yet, so it can turn the flag on. Named
+// "...Death" rather than "...DeathTest": the test-name validator reserves "Test" for
+// the leading keyword.
+namespace
+{
+
+[[noreturn]] void exitWithBenchmarkReferenceWiring()
+{
+    TestConfigOptions options;
+    options.benchmarkReference = true;
+    TestConfig::initialize(options);
+    const bool wired = TestConfig::get().benchmarkReference()
+                       && productionPolicy(TensorPlacement::HOST).benchmarkReference;
+    std::exit(wired ? 0 : 1);
+}
+
+} // namespace
+
+TEST(TestProductionPolicyDeath, BenchmarkReferenceReachesConfigAndPolicy)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    // EXPECT_EXIT expands to a switch with no default label, attributed to this site.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wswitch-default"
+    EXPECT_EXIT(exitWithBenchmarkReferenceWiring(), ::testing::ExitedWithCode(0), "");
+#pragma clang diagnostic pop
 }
 
 // NOLINTEND(readability-identifier-naming)

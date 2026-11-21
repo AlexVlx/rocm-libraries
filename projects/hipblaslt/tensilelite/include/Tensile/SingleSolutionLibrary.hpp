@@ -28,7 +28,9 @@
 
 #include <Tensile/Debug.hpp>
 #include <Tensile/PredicateDebugger.hpp>
+#include <Tensile/SolutionBlobCache.hpp>
 #include <Tensile/SolutionLibrary.hpp>
+#include <Tensile/Utils.hpp>
 
 #include <tensilelitehost/export.h>
 
@@ -60,6 +62,13 @@ namespace TensileLite
                 rv += ": ";
                 rv += solution->name();
             }
+            else if(m_cache)
+            {
+                // Deliberately does not resolve: this is called from debug
+                // printing on selection paths, and forcing a parse just to
+                // build a log line would defeat lazy loading.
+                rv += concatenate(" (index ", m_index, ", unresolved)");
+            }
             else
             {
                 rv += " (nullptr)";
@@ -76,10 +85,34 @@ namespace TensileLite
         {
         }
 
+        /// Lazy form: remembers which solution it stands for and asks the cache
+        /// for it when a query actually needs it.
+        SingleSolutionLibrary(int index, std::shared_ptr<SolutionBlobCache<MySolution>> cache)
+            : m_index(index)
+            , m_cache(std::move(cache))
+        {
+        }
+
+        /// The index of the solution this leaf stands for, without resolving a
+        /// lazy leaf. -1 if it stands for none.
+        int solutionIndex() const
+        {
+            return solution ? solution->index : m_index;
+        }
+
         virtual std::shared_ptr<MySolution> getSolutionByIndex(MyProblem const& problem,
                                                                Hardware const&  hardware,
                                                                const int index) const override
         {
+            // Compare before resolving. A tree walk looking for one index would
+            // otherwise parse every leaf it passes.
+            if(m_cache)
+            {
+                if(m_index != index)
+                    return std::shared_ptr<MySolution>();
+                return resolved();
+            }
+
             if(solution && solution->index == index)
             {
                 return solution;
@@ -94,6 +127,7 @@ namespace TensileLite
         {
             bool debug = Debug::Instance().printPredicateEvaluation();
 
+            auto solution = resolved();
             if(solution)
             {
                 Task task(hardware, problem, *(solution));
@@ -130,6 +164,9 @@ namespace TensileLite
         {
             bool debug = Debug::Instance().printPredicateEvaluation();
 
+            auto solution = resolved();
+            if(solution && !solution->deviceScalarAlphaSupported(problems))
+                return {};
             if(solution)
             {
                 if(debug)
@@ -152,6 +189,15 @@ namespace TensileLite
                     return std::shared_ptr<MySolution>();
                 }
 
+                // Workspace sizing throws for clustered StreamK on grouped GEMM.
+                // Reject the solution so that throw cannot abort the search.
+                if(solution->usesStreamKSpatialCluster())
+                {
+                    if(debug)
+                        PredicateDebugger::printFooter(std::cout, false);
+                    return std::shared_ptr<MySolution>();
+                }
+
                 size_t ws = (*solution).requiredWorkspaceSizeGroupedGemm(problems, hardware);
 
                 for(size_t idx = 0; idx < problems.size(); idx++)
@@ -166,7 +212,7 @@ namespace TensileLite
                     // SynchronizerSizeCheck / LeadingFree1SizesGreaterOrEqual on this local
                     // problem copy, so it stays behind the USO check with softwarePredicate().
                     bool swMatch;
-                    if(problem.getParams().uniformSummationOrder())
+                    if(problem.getParams().uniformSummationOrder() != 0)
                     {
                         problem.setGroupedGemm(true);
                         swMatch = softwarePredicate(SolutionLibrarySearchType::DEFAULT,
@@ -188,11 +234,7 @@ namespace TensileLite
                     }
                 }
 
-                if(solution->requiredHostWorkspaceSizePerProblem == static_cast<size_t>(-1))
-                {
-                    solution->requiredHostWorkspaceSizePerProblem
-                        = solution->requiredHostSizeGroupedGemmSingle(problems[0], hardware);
-                }
+                solution->ensureRequiredHostWorkspaceSize(problems[0], hardware);
 
                 if(debug)
                     PredicateDebugger::printFooter(std::cout, true);
@@ -214,6 +256,7 @@ namespace TensileLite
         {
             bool debug = Debug::Instance().printPredicateEvaluation();
 
+            auto solution    = resolved();
             bool useSolution = false;
             if(solution)
             {
@@ -255,6 +298,10 @@ namespace TensileLite
         {
             bool debug = Debug::Instance().printPredicateEvaluation();
 
+            auto solution    = resolved();
+            if(solution && searchType == SolutionLibrarySearchType::DEFAULT
+               && !solution->deviceScalarAlphaSupported(problems))
+                return {};
             bool useSolution = false;
             if(solution)
             {
@@ -264,7 +311,13 @@ namespace TensileLite
                 if((*solution->hardwarePredicate)(hardware))
                     useSolution = true;
 
-                if(searchType == SolutionLibrarySearchType::DEFAULT)
+                // Same rejection as findBestSolution(): do not size workspace for a
+                // clustered StreamK solution, which throws on grouped GEMM.
+                // DEFAULT search sizes workspace even when the hardware predicate
+                // failed, so this has to win over that call.
+                if(solution->usesStreamKSpatialCluster())
+                    useSolution = false;
+                else if(searchType == SolutionLibrarySearchType::DEFAULT)
                 {
                     size_t ws = (*solution).requiredWorkspaceSizeGroupedGemm(problems, hardware);
 
@@ -278,7 +331,7 @@ namespace TensileLite
                         // softwarePredicate() widening stay behind the USO check, so with USO off
                         // this stays the problemPredicate && taskPredicate filter.
                         bool swMatch;
-                        if(problem.getParams().uniformSummationOrder())
+                        if(problem.getParams().uniformSummationOrder() != 0)
                         {
                             problem.setGroupedGemm(true);
                             swMatch
@@ -293,7 +346,7 @@ namespace TensileLite
                             useSolution = false;
                     }
                 }
-                else if(searchType == SolutionLibrarySearchType::GEMM_TYPE_ONLY)
+                else if(isGemmTypeOnlySearch(searchType))
                 {
                     if(!isGemmTypeSame((*solution), problems[0]))
                         useSolution = false;
@@ -320,16 +373,31 @@ namespace TensileLite
 
             if(useSolution)
             {
-                if(solution->requiredHostWorkspaceSizePerProblem == static_cast<size_t>(-1))
-                {
-                    solution->requiredHostWorkspaceSizePerProblem
-                        = solution->requiredHostSizeGroupedGemmSingle(problems[0], hardware);
-                }
+                solution->ensureRequiredHostWorkspaceSize(problems[0], hardware);
                 return SolutionSet<MySolution>({solution});
             }
 
             return SolutionSet<MySolution>();
         }
+
+    private:
+        /// The solution this leaf stands for, parsing it from the blob on first
+        /// use when the library was loaded in indexed form.
+        ///
+        /// Deliberately does not memoize into `solution`: several matching table
+        /// rows can wrap the same index, and concurrent queries would then race
+        /// writing that shared_ptr. The cache is already the memo, and its hit
+        /// path is a lookup under a shared lock.
+        std::shared_ptr<MySolution> resolved() const
+        {
+            if(solution || !m_cache)
+                return solution;
+
+            return m_cache->get(m_index);
+        }
+
+        int                                           m_index = -1;
+        std::shared_ptr<SolutionBlobCache<MySolution>> m_cache;
     };
 } // namespace TensileLite
 
